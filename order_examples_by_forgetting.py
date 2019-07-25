@@ -6,8 +6,8 @@ import pickle
 
 # Calculates forgetting statistics per example
 #
-# diag_stats: dictionary created during training containing 
-#             loss, accuracy, and missclassification margin 
+# diag_stats: dictionary created during training containing
+#             loss, accuracy, and missclassification margin
 #             per example presentation
 # npresentations: number of training epochs
 #
@@ -36,7 +36,7 @@ def compute_forgetting_statistics(diag_stats, npresentations):
             else:
                 unlearned_per_presentation[example_id] = []
 
-            # Find number of presentations needed to learn example, 
+            # Find number of presentations needed to learn example,
             # e.g. last presentation when acc is 0
             if len(np.where(presentation_acc == 0)[0]) > 0:
                 presentations_needed_to_learn[example_id] = np.where(
@@ -48,7 +48,7 @@ def compute_forgetting_statistics(diag_stats, npresentations):
             margins_per_presentation = np.array(
                 example_stats[2][:npresentations])
 
-            # Find the presentation at which the example was first learned, 
+            # Find the presentation at which the example was first learned,
             # e.g. first presentation when acc is 1
             if len(np.where(presentation_acc == 1)[0]) > 0:
                 first_learned[example_id] = np.where(
@@ -176,6 +176,11 @@ if __name__ == "__main__":
         # Sort examples by forgetting counts in ascending order, over one or more training runs
         ordered_examples, ordered_values = sort_examples_by_forgetting(
             unlearned_per_presentation_all, first_learned_all, args.epochs)
+        print("ordered_examples")
+        print(ordered_examples)
+        print(max(ordered_examples))
+        print("ordered_values")
+        print(ordered_values)
 
         # Save sorted output
         if args.output_name.endswith('.pkl'):
