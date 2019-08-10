@@ -12,16 +12,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
+from torch.utils.data import Subset
 from torch.optim.lr_scheduler import MultiStepLR
 
 from torchvision.utils import make_grid
 from torchvision import datasets, transforms
 
-from Cutout.util.misc import CSVLogger
 from Cutout.util.cutout import Cutout
 
 from Cutout.model.resnet import ResNet18
 from Cutout.model.wide_resnet import WideResNet
+
+from foo import *
 
 
 # Format time for printing purposes
@@ -234,19 +236,9 @@ parser.add_argument(
     default=False,
     help='augment data by flipping and cropping')
 parser.add_argument(
-    '--cutout', action='store_true', default=False, help='apply cutout')
-parser.add_argument(
-    '--n_holes',
-    type=int,
-    default=1,
-    help='number of holes to cut out from image')
-parser.add_argument(
-    '--length', type=int, default=16, help='length of the holes')
-parser.add_argument(
-    '--no-cuda',
-    action='store_true',
-    default=False,
-    help='enables CUDA training')
+    '--device',
+    type=str,
+    default='cuda')
 parser.add_argument(
     '--seed', type=int, default=1, help='random seed (default: 1)')
 parser.add_argument(
@@ -267,6 +259,21 @@ parser.add_argument(
     help=
     'number of sorted examples to keep that have the lowest score, equivalent to start index of removal, if a negative number given, remove random draw of examples'
 )
+parser.add_argument(
+    '--mode',
+    type=str,
+    default='online',
+    choices=['online', 'once', 'pretrained']
+)
+parser.add_argument(
+    '--remove_mode',
+    type=str,
+    default='unforgettable',
+    choices=['random', 'forgettable', 'unforgettable'])
+parser.add_argument(
+    '--burn_in_epochs',
+    type=int,
+    default=0)
 parser.add_argument(
     '--remove_subsample',
     type=int,
@@ -300,9 +307,9 @@ parser.add_argument(
 
 # Enter all arguments that you want to be in the filename of the saved output
 ordered_args = [
-    'dataset', 'data_augmentation', 'cutout', 'seed', 'sorting_file',
-    'remove_n', 'keep_lowest_n', 'remove_subsample', 'noise_percent_labels',
-    'noise_percent_pixels', 'noise_std_pixels'
+    'dataset', 'data_augmentation', 'seed', 'sorting_file',
+    'remove_n', 'keep_lowest_n', 'burn_in_epochs', 'mode',
+    'remove_mode'
 ]
 
 # Parse arguments and setup name of output file with forgetting stats
@@ -313,15 +320,13 @@ save_fname = '__'.join(
     '{}_{}'.format(arg, args_dict[arg]) for arg in ordered_args)
 
 # Set appropriate devices
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-use_cuda = args.cuda
-device = torch.device("cuda" if use_cuda else "cpu")
+device = torch.device(args.device)
 print('run on device: {0}'.format(device))
 cudnn.benchmark = True  # Should make training go faster for large models
 
 # Set random seed for initialization
 torch.manual_seed(args.seed)
-if args.cuda:
+if 'cuda' in args.device:
     torch.cuda.manual_seed(args.seed)
 npr.seed(args.seed)
 
@@ -337,9 +342,6 @@ if args.data_augmentation:
     train_transform.transforms.append(transforms.RandomHorizontalFlip())
 train_transform.transforms.append(transforms.ToTensor())
 train_transform.transforms.append(normalize)
-if args.cutout:
-    train_transform.transforms.append(
-        Cutout(n_holes=args.n_holes, length=args.length))
 
 # Setup test transforms
 test_transform = transforms.Compose([transforms.ToTensor(), normalize])
@@ -479,7 +481,7 @@ else:
         'Specified model not recognized. Options are: resnet18 and wideresnet')
 
 # Setup loss
-model = model.cuda()
+model = model.to(args.device)
 criterion = nn.CrossEntropyLoss().cuda()
 criterion.__init__(reduce=False)
 
@@ -498,12 +500,22 @@ elif args.optimizer == 'sgd':
 else:
     print('Specified optimizer not recognized. Options are: adam and sgd')
 
+print(dir(train_dataset))
+
 # Initialize dictionary to save statistics for every example presentation
 example_stats = {}
 
 best_acc = 0
 elapsed_time = 0
+train_idx = np.array(range(0, len(train_dataset)))
 for epoch in range(args.epochs):
+    if (args.mode == 'online' and epoch >= args.burn_in_epochs) or \
+        (args.mode == 'once' and epoch == args.burn_in_epochs):
+        _, unlearned_per_presentation, _, first_learned = compute_forgetting_statistics(example_stats, epoch)
+        ordered_examples, ordered_values = sort_examples_by_forgetting([unlearned_per_presentation], [first_learned], epoch)
+        train_idx = sample_dataset_by_forgetting(train_dataset, ordered_examples, ordered_values, args.remove_n, args.remove_mode)
+        print("new dataset size: {0}".format(len(train_idx)))
+
     start_time = time.time()
 
     train(args, model, device, train_dataset, model_optimizer, epoch,
