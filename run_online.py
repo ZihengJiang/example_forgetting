@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
-from torch.utils.data import Subset
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
 
 from torchvision.utils import make_grid
@@ -61,7 +61,7 @@ def noisy(image, noise_percentage, noise_std):
 #
 # example_stats: dictionary containing statistics accumulated over every presentation of example
 #
-def train(args, model, device, trainset, model_optimizer, epoch,
+def train(args, model, device, train_loader, model_optimizer, epoch,
           example_stats):
     train_loss = 0.
     correct = 0.
@@ -69,30 +69,11 @@ def train(args, model, device, trainset, model_optimizer, epoch,
 
     model.train()
 
-    # Get permutation to shuffle trainset
-    trainset_permutation_inds = npr.permutation(
-        np.arange(len(trainset.targets)))
 
     print('\n=> Training Epoch #%d' % (epoch))
-
-    batch_size = args.batch_size
-    for batch_idx, batch_start_ind in enumerate(
-            range(0, len(trainset.targets), batch_size)):
-
-        # Get trainset indices for batch
-        batch_inds = trainset_permutation_inds[batch_start_ind:
-                                               batch_start_ind + batch_size]
-
-        # Get batch inputs and targets, transform them appropriately
-        transformed_trainset = []
-        for ind in batch_inds:
-            transformed_trainset.append(trainset.__getitem__(ind)[0])
-        inputs = torch.stack(transformed_trainset)
-        targets = torch.LongTensor(
-            np.array(trainset.targets)[batch_inds].tolist())
-
-        # Map to available device
-        inputs, targets = inputs.to(device), targets.to(device)
+    for batch_idx, data in enumerate(train_loader, 0):
+        inputs, targets = data[0].to(device), data[1].to(device)
+        example_indexes = data[2]
 
         # Forward propagation, compute loss, get predictions
         model_optimizer.zero_grad()
@@ -102,15 +83,12 @@ def train(args, model, device, trainset, model_optimizer, epoch,
 
         # Update statistics and loss
         acc = predicted == targets
-        for j, index in enumerate(batch_inds):
-
-            # Get index in original dataset (not sorted by forgetting)
-            index_in_original_dataset = train_indx[index]
-
+        for idx, index in enumerate(example_indexes):
+            index_in_original_dataset = index.item()
             # Compute missclassification margin
-            output_correct_class = outputs.data[j, targets[j].item()]
-            sorted_output, _ = torch.sort(outputs.data[j, :])
-            if acc[j]:
+            output_correct_class = outputs.data[idx, targets[idx].item()]
+            sorted_output, _ = torch.sort(outputs.data[idx, :])
+            if acc[idx]:
                 # Example classified correctly, highest incorrect class is 2nd largest output
                 output_highest_incorrect_class = sorted_output[-2]
             else:
@@ -122,8 +100,8 @@ def train(args, model, device, trainset, model_optimizer, epoch,
             # Add the statistics of the current training example to dictionary
             index_stats = example_stats.get(index_in_original_dataset,
                                             [[], [], []])
-            index_stats[0].append(loss[j].item())
-            index_stats[1].append(acc[j].sum().item())
+            index_stats[0].append(loss[idx].item())
+            index_stats[1].append(acc[idx].sum().item())
             index_stats[2].append(margin)
             example_stats[index_in_original_dataset] = index_stats
 
@@ -138,9 +116,8 @@ def train(args, model, device, trainset, model_optimizer, epoch,
         sys.stdout.write('\r')
         sys.stdout.write(
             '| Epoch [%3d/%3d] Iter[%3d/%3d]\t\tLoss: %.4f Acc@1: %.3f%%' %
-            (epoch, args.epochs, batch_idx + 1,
-             (len(trainset) // batch_size) + 1, loss.item(),
-             100. * correct.item() / total))
+            (epoch, args.epochs, batch_idx + 1, len(train_loader),
+             loss.item(), 100. * correct.item() / total))
         sys.stdout.flush()
 
         # Add training accuracy to dict
@@ -263,10 +240,10 @@ parser.add_argument(
     '--mode',
     type=str,
     default='online',
-    choices=['online', 'once', 'pretrained']
+    choices=['normal', 'online', 'offline']
 )
 parser.add_argument(
-    '--remove_mode',
+    '--remove_strategy',
     type=str,
     default='unforgettable',
     choices=['random', 'forgettable', 'unforgettable'])
@@ -309,7 +286,7 @@ parser.add_argument(
 ordered_args = [
     'dataset', 'data_augmentation', 'seed', 'sorting_file',
     'remove_n', 'keep_lowest_n', 'burn_in_epochs', 'mode',
-    'remove_mode'
+    'remove_strategy', 'noise_percent_labels',
 ]
 
 # Parse arguments and setup name of output file with forgetting stats
@@ -500,25 +477,26 @@ elif args.optimizer == 'sgd':
 else:
     print('Specified optimizer not recognized. Options are: adam and sgd')
 
-print(dir(train_dataset))
-
 # Initialize dictionary to save statistics for every example presentation
 example_stats = {}
 
 best_acc = 0
 elapsed_time = 0
-train_idx = np.array(range(0, len(train_dataset)))
+# train_idx = np.array(range(0, len(train_dataset)))
+train_dataset = IndexedDataset(train_dataset)
+train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 for epoch in range(args.epochs):
     if (args.mode == 'online' and epoch >= args.burn_in_epochs) or \
         (args.mode == 'once' and epoch == args.burn_in_epochs):
         _, unlearned_per_presentation, _, first_learned = compute_forgetting_statistics(example_stats, epoch)
         ordered_examples, ordered_values = sort_examples_by_forgetting([unlearned_per_presentation], [first_learned], epoch)
-        train_idx = sample_dataset_by_forgetting(train_dataset, ordered_examples, ordered_values, args.remove_n, args.remove_mode)
+        train_idx = sample_dataset_by_forgetting(train_dataset, ordered_examples, ordered_values, args.remove_n, args.remove_strategy)
+        sampler = torch.utils.data.SubsetRandomSampler(train_idx)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler)
         print("new dataset size: {0}".format(len(train_idx)))
 
     start_time = time.time()
-
-    train(args, model, device, train_dataset, model_optimizer, epoch,
+    train(args, model, device, train_loader, model_optimizer, epoch,
           example_stats)
     test(epoch, model, device, example_stats)
 
