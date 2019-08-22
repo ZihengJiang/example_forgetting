@@ -2,19 +2,45 @@ import argparse
 import numpy as np
 import os
 import pickle
-from torch.utils.data import Dataset
 
 
-class IndexedDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
+def select_subset():
+    # Get indices of examples that should be used for training
+    if args.sorting_file == 'none':
+        train_indx = np.array(range(len(train_ds.targets)))
+    else:
+        try:
+            with open(
+                    os.path.join(args.input_dir, args.sorting_file) + '.pkl',
+                    'rb') as fin:
+                ordered_indx = pickle.load(fin)['indices']
+        except IOError:
+            with open(os.path.join(args.input_dir, args.sorting_file),
+                      'rb') as fin:
+                ordered_indx = pickle.load(fin)['indices']
 
-    def __getitem__(self, index):
-        data, target = self.dataset[index]
-        return data, target, index
+        # Get the indices to remove from training
+        elements_to_remove = np.array(
+            ordered_indx)[args.keep_lowest_n:args.keep_lowest_n + args.remove_n]
 
-    def __len__(self):
-        return len(self.dataset)
+        # Remove the corresponding elements
+        train_indx = np.setdiff1d(
+            range(len(train_ds.targets)), elements_to_remove)
+
+    if args.keep_lowest_n < 0:
+        # Remove remove_n number of examples from the train set at random
+        train_indx = npr.permutation(np.arange(len(
+            train_ds.targets)))[:len(train_ds.targets) -
+                                          args.remove_n]
+
+    elif args.remove_subsample:
+        # Remove remove_sample number of examples at random from the first keep_lowest_n examples
+        # Useful when the first keep_lowest_n examples have equal forgetting counts
+        lowest_n = np.array(ordered_indx)[0:args.keep_lowest_n]
+        train_indx = lowest_n[npr.permutation(np.arange(
+            args.keep_lowest_n))[:args.keep_lowest_n - args.remove_subsample]]
+        train_indx = np.hstack((train_indx,
+                                np.array(ordered_indx)[args.keep_lowest_n:]))
 
 
 # Calculates forgetting statistics per example
@@ -127,38 +153,19 @@ def sample_dataset_by_forgetting(dataset, ordered_example, ordered_values, remov
         raise ValueError('unsupported remove mode: {0}'.format(remove_strategy))
 
     # Remove the corresponding elements
-    train_indx = np.setdiff1d(
-        range(len(dataset)), elements_to_remove)
-    return train_indx
+    train_idx = np.setdiff1d(range(len(dataset)), elements_to_remove)
+    return train_idx
 
 
-# Checks whether a given file name matches a list of specified arguments
-#
-# fname: string containing file name
-# args_list: list of strings containing argument names and values, i.e. [arg1, val1, arg2, val2,..]
-#
-# Returns 1 if filename matches the filter specified by the argument list, 0 otherwise
-#
-def check_filename(fname, args_list):
-
-    # If no arguments are specified to filter by, pass filename
-    if args_list is None:
-        return 1
-
-    for arg_ind in np.arange(0, len(args_list), 2):
-        arg = args_list[arg_ind]
-        arg_value = args_list[arg_ind + 1]
-
-        # Check if filename matches the current arg and arg value
-        if arg + '_' + arg_value + '__' not in fname:
-            print('skipping file: ' + fname)
-            return 0
-
-    return 1
+def update_example_weights(weights, stats, epoch):
+    decay = 0.95
+    margin = np.array([stats[idx][2][epoch] for idx in range(len(weights))])
+    # margin = softmax(output_correct_class) \in [0, 1]
+    weights = weights * decay + (1 - decay) * (1 - margin)
+    return weights
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(description="Options")
     parser.add_argument('--input_dir', type=str, required=True)
     parser.add_argument(
