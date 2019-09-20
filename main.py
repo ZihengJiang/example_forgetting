@@ -8,8 +8,6 @@ import sys
 import pickle
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
@@ -19,6 +17,7 @@ from utils import *
 from stats import *
 from model.resnet import ResNet18
 from model.wide_resnet import WideResNet
+from model.cnn import CNN
 from dataset import get_data, noise_labels
 
 
@@ -43,7 +42,8 @@ def eval_on_batch(model, criterion, inputs, targets, indexes, example_stats):
         else:
             # Example misclassified, highest incorrect class is max output
             output_highest_incorrect_class = sorted_output[-1]
-        margin = output_correct_class.item()
+        correct_confidence = output_correct_class.item()
+        incorrect_confidence = output_highest_incorrect_class.item()
         # margin = output_correct_class.item() - output_highest_incorrect_class.item()
 
         # Add the statistics of the current training example to dictionary
@@ -51,7 +51,7 @@ def eval_on_batch(model, criterion, inputs, targets, indexes, example_stats):
                                         [[], [], []])
         index_stats[0].append(loss[idx].item())
         index_stats[1].append(acc[idx].sum().item())
-        index_stats[2].append(margin)
+        index_stats[2].append((correct_confidence, incorrect_confidence))
         example_stats[index_in_original_dataset] = index_stats
 
     return outputs, loss
@@ -122,7 +122,7 @@ def evaluate_on_removed(model, criterion, device, loader, epoch, example_stats):
         moving_correct += predicted.eq(targets.data).cpu().sum()
         acc = 100. * moving_correct.item() / total
 
-    print("| Removed Set Epoch #%d\t\t\tLoss: %.4f Acc@1: %.2f%%" %
+    print("| Removed Set Epoch #%d\t\tLoss: %.4f Acc@1: %.2f%%" %
           (epoch, loss.item(), acc))
     index_stats = example_stats.get('removed_acc', [[], []])
     index_stats[1].append(100. * moving_correct.item() / float(total))
@@ -177,15 +177,14 @@ def main(args):
     # Enter all arguments that you want to be in the filename of the saved output
     ordered_args = [
         'dataset', 'data_augmentation', 'seed', 'sorting_file',
-        'remove_n', 'burn_in_epochs', 'mode', 'remove_strategy',
+        'remove_percent', 'burn_in_epochs', 'remove_strategy',
         'noise_percent_labels',
     ]
     save_fname = '__'.join(
         '{}_{}'.format(arg, args_dict[arg]) for arg in ordered_args)
     fname = os.path.join(args.output_dir, save_fname)
     if os.path.exists(fname + '__stats_dict.pkl'):
-        return
-        redo = input("There exists experiment result already, continue? [yes/no]")
+        redo = input("There exists experiment result already, continue? [yes/no] ")
         if redo == 'no':
             exit()
         elif redo == 'yes':
@@ -213,7 +212,7 @@ def main(args):
         pass
 
     if args.noise_percent_labels:
-        train_ds = noise_labels(train_ds, args.noise_percent_labels, fname)
+        train_ds, noise_indexes = noise_labels(train_ds, args.noise_percent_labels, fname)
 
     print('Training on ' + str(len(train_ds)) + ' examples')
 
@@ -227,13 +226,15 @@ def main(args):
         else:
             model = WideResNet(
                 depth=28, num_classes=num_classes, widen_factor=10, dropRate=0.3)
+    elif args.model == 'cnn':
+        model = CNN(num_classes=num_classes)
     else:
         print(
             'Specified model not recognized. Options are: resnet18 and wideresnet')
 
     # Setup loss
     model = model.to(args.device)
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = torch.nn.CrossEntropyLoss().cuda()
     criterion.__init__(reduce=False)
 
     # Setup optimizer
@@ -265,20 +266,37 @@ def main(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     for epoch in range(args.epochs):
         if args.remove_strategy != 'normal' and epoch >= args.burn_in_epochs:
-            if args.remove_strategy == 'sampling':
+            if 'sampling' in args.remove_strategy:
                 # sampling by weight
                 normalized_weights = example_weights / example_weights.sum()
                 index_stats = example_stats.get('example_weights', [[], []])
                 index_stats[1].append(normalized_weights)
                 example_stats['example_weights'] = index_stats
 
-                train_idx = np.random.choice(range(num_examples), size=(num_examples-args.remove_n),
+                choice_num = int(num_examples * (1 - args.remove_percent / 100))
+                train_idx = np.random.choice(range(num_examples), size=choice_num,
                     replace=False, p=normalized_weights)
+            elif args.remove_strategy == 'low-acc':
+                remove_n = int(args.remove_percent * num_examples / 100)
+                losses = []
+                for idx in range(num_examples):
+                    losses.append(example_stats[idx][0][epoch-1])
+                losses = np.array(losses)
+                sorted_indexes = np.argsort(losses)
+                train_idx = sorted_indexes[:num_examples - remove_n]
+            elif args.remove_strategy == 'all-noise':
+                remove_n = int(args.remove_percent * num_examples / 100)
+                if args.remove_percent <= args.noise_percent_labels:
+                    remove_indexes = npr.choice(noise_indexes, remove_n, replace=False)
+                    train_idx = np.setdiff1d(range(num_examples), remove_indexes)
+                else:
+                    train_idx = np.setdiff1d(range(num_examples), noise_indexes)
+                    train_idx = npr.choice(train_idx, num_examples - remove_n, replace=False)
             else:
                 # event method
                 _, unlearned_per_presentation, _, first_learned = compute_forgetting_statistics(example_stats, epoch)
                 ordered_examples, ordered_values = sort_examples_by_forgetting([unlearned_per_presentation], [first_learned], epoch)
-                train_idx = sample_dataset_by_forgetting(train_ds, ordered_examples, ordered_values, args.remove_n, args.remove_strategy)
+                train_idx = sample_dataset_by_forgetting(train_ds, ordered_examples, ordered_values, args.remove_percent, args.remove_strategy)
             sampler = torch.utils.data.SubsetRandomSampler(train_idx)
             train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler)
 
@@ -296,8 +314,8 @@ def main(args):
             removed_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler)
             evaluate_on_removed(model, criterion, device, removed_loader, epoch, example_stats)
 
-        if args.remove_strategy == 'sampling':
-            example_weights = update_example_weights(example_weights, example_stats, epoch)
+        if 'sampling' in args.remove_strategy:
+            example_weights = update_example_weights(example_weights, example_stats, epoch, args.remove_strategy)
 
         epoch_time = time.time() - start_time
         elapsed_time += epoch_time
@@ -322,8 +340,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CNN')
-    parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100'])
-    parser.add_argument('--model', default='resnet18', choices=['resnet18', 'wideresnet'])
+    parser.add_argument('--dataset', default='cifar10', choices=['mnist', 'cifar10', 'cifar100', 'svhn'])
+    parser.add_argument('--model', default='resnet18', choices=['cnn', 'resnet18', 'wideresnet', ])
     parser.add_argument(
         '--batch_size',
         type=int,
@@ -354,21 +372,15 @@ if __name__ == '__main__':
         'name of a file containing order of examples sorted by forgetting (default: "none", i.e. not sorted)'
     )
     parser.add_argument(
-        '--remove_n',
+        '--remove_percent',
         type=int,
         default=0,
         help='number of sorted examples to remove from training')
     parser.add_argument(
-        '--mode',
-        type=str,
-        default='online',
-        choices=['online',]
-    )
-    parser.add_argument(
         '--remove_strategy',
         type=str,
         default='unforgettable',
-        choices=['normal', 'random', 'forgettable', 'unforgettable', 'sampling'])
+        choices=['normal', 'random', 'forgettable', 'unforgettable',  'low-acc', 'all-noise', 'sampling', 'sampling1', 'sampling2', 'sampling3'])
     parser.add_argument(
         '--burn_in_epochs',
         type=int,

@@ -139,10 +139,11 @@ def sort_examples_by_forgetting(unlearned_per_presentation_all,
         example_stats)], np.sort(example_stats)
 
 
-def sample_dataset_by_forgetting(dataset, ordered_example, ordered_values, remove_num, remove_strategy):
+def sample_dataset_by_forgetting(dataset, ordered_example, ordered_values, remove_percent, remove_strategy):
     assert len(dataset) == len(ordered_example)
     assert len(dataset) == len(ordered_values)
     num = len(dataset)
+    remove_num = int(num * remove_percent / 100)
     if remove_strategy == 'forgettable':
         elements_to_remove = np.array(ordered_example)[num - remove_num:]
     elif remove_strategy == 'unforgettable':
@@ -157,11 +158,25 @@ def sample_dataset_by_forgetting(dataset, ordered_example, ordered_values, remov
     return train_idx
 
 
-def update_example_weights(weights, stats, epoch):
-    decay = 0.95
-    margin = np.array([stats[idx][2][epoch] for idx in range(len(weights))])
-    # margin = softmax(output_correct_class) \in [0, 1]
-    weights = weights * decay + (1 - decay) * (1 - margin)
+def update_example_weights(weights, stats, epoch, strategy):
+    decay = 0.9
+    if strategy == 'sampling1':
+        a_t = np.array([stats[idx][2][epoch][0] - stats[idx][2][epoch][1] for idx in range(len(weights))])
+        a_t_1 = np.array([stats[idx][2][epoch-1][0] - stats[idx][2][epoch-1][1] for idx in range(len(weights))])
+        soft_forgetting = np.maximum(0.0, a_t_1 - a_t)
+        weights = weights * decay + (1 - decay) * soft_forgetting
+    elif strategy == 'sampling2':
+        a_t = np.array([stats[idx][2][epoch][0] for idx in range(len(weights))])
+        a_t_1 = np.array([stats[idx][2][epoch-1][0] for idx in range(len(weights))])
+        soft_forgetting = np.maximum(0, a_t_1 - a_t)
+        weights = weights * decay + (1 - decay) * soft_forgetting
+    elif strategy == 'sampling3':
+        a_t = np.array([stats[idx][2][epoch][0] for idx in range(len(weights))])
+        a_t_1 = np.array([stats[idx][2][epoch-1][0] for idx in range(len(weights))])
+        soft_forgetting = np.abs(a_t_1 - a_t)
+        weights = weights * decay + (1 - decay) * soft_forgetting
+    else:
+        raise ValueError
     return weights
 
 
