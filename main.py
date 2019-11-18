@@ -18,7 +18,7 @@ from stats import *
 from model.resnet import ResNet18
 from model.wide_resnet import WideResNet
 from model.cnn import CNN
-from dataset import get_data, noise_labels
+from dataset import get_data, noise_labels, noise_pixels
 
 
 
@@ -176,9 +176,10 @@ def test(epoch, model, criterion, device, loader, example_stats, checkpoint_fnam
 def main(args):
     # Enter all arguments that you want to be in the filename of the saved output
     ordered_args = [
-        'dataset', 'data_augmentation', 'seed', 'sorting_file',
+        'dataset', 'data_augmentation', 'seed',
         'remove_percent', 'burn_in_epochs', 'remove_strategy',
-        'noise_percent_labels',
+        'noise_percent', 'noise_labels', 'noise_pixels_percent',
+        'noise_pixels_std', 'optimizer', 'learning_rate',
     ]
     save_fname = '__'.join(
         '{}_{}'.format(arg, args_dict[arg]) for arg in ordered_args)
@@ -208,11 +209,14 @@ def main(args):
 
     train_ds, test_ds, num_classes = get_data(args.dataset)
 
-    if args.noise_percent_pixels:
-        pass
+    if args.noise_percent > 0:
+        assert not (args.noise_labels and (args.noise_pixels_percent > 0))
+        if args.noise_labels:
+            train_ds, noise_indexes = noise_labels(train_ds, args.noise_percent, fname)
+        if args.noise_pixels_percent:
+            train_ds, noise_indexes = noise_pixels(train_ds, args.noise_percent,
+                args.noise_pixels_percent, args.noise_pixels_std, fname)
 
-    if args.noise_percent_labels:
-        train_ds, noise_indexes = noise_labels(train_ds, args.noise_percent_labels, fname)
 
     print('Training on ' + str(len(train_ds)) + ' examples')
 
@@ -249,6 +253,13 @@ def main(args):
             weight_decay=5e-4)
         scheduler = MultiStepLR(
             model_optimizer, milestones=[60, 120, 160], gamma=0.2)
+    elif args.optimizer == 'sgd-const-lr':
+        model_optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.learning_rate,
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=5e-4)
     else:
         print('Specified optimizer not recognized. Options are: adam and sgd')
 
@@ -340,7 +351,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CNN')
-    parser.add_argument('--dataset', default='cifar10', choices=['mnist', 'cifar10', 'cifar100', 'svhn'])
+    parser.add_argument('--dataset', default='cifar10', choices=['mnist', 'cifar10', 'cifar100', 'cifar10tfds', 'svhn'])
     parser.add_argument('--model', default='resnet18', choices=['cnn', 'resnet18', 'wideresnet', ])
     parser.add_argument(
         '--batch_size',
@@ -398,28 +409,34 @@ if __name__ == '__main__':
     #     default=0,
     #     help='number of examples to remove from the keep-lowest-n examples')
     parser.add_argument(
-        '--noise_percent_labels',
+        '--noise_percent',
         type=int,
         default=0,
+        help='percent of noise data')
+    parser.add_argument(
+        '--noise_labels',
+        type=bool,
+        default=False,
         help='percent of labels to randomly flip to a different label')
     parser.add_argument(
-        '--noise_percent_pixels',
+        '--noise_pixels_percent',
         type=int,
         default=0,
         help='percent of pixels to randomly introduce Gaussian noise to')
     parser.add_argument(
-        '--noise_std_pixels',
+        '--noise_pixels_std',
         type=float,
         default=0,
         help='standard deviation of Gaussian pixel noise')
     parser.add_argument(
         '--optimizer',
         default="sgd",
+        choices=['sgd', 'sgd-const-lr', 'adam'],
         help='optimizer to use, default is sgd. Can also use adam')
-    parser.add_argument(
-        '--input_dir',
-        default='cifar10_results/',
-        help='directory where to read sorting file from')
+    # parser.add_argument(
+    #     '--input_dir',
+    #     default='cifar10_results/',
+    #     help='directory where to read sorting file from')
     parser.add_argument(
         '--output_dir', required=True, help='directory where to save results')
 
